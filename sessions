@@ -21,9 +21,21 @@ from pathlib import Path
 
 HOME = Path.home()
 PROJECTS_DIR = HOME / ".claude" / "projects"
+# VS Code extension + Claude Desktop store per-session metadata here. The
+# matching transcript (if any) lives in PROJECTS_DIR keyed by `cliSessionId`.
+# When that transcript has aged out (default 30d, user's setting 90d), this
+# metadata file is all that remains — we surface it as an "orphan" row.
+VSCODE_SESSIONS_DIR = HOME / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
 CACHE_DIR = HOME / ".cache" / "sessions"
 CACHE_FILE = CACHE_DIR / "index.json"
 CACHE_TTL = 300  # 5 min
+
+# Map JSONL `entrypoint` values to short tags used in row labels + the --source filter.
+ENTRYPOINT_TO_SOURCE = {
+    "cli": "cli",
+    "claude-vscode": "vscode",
+    "claude-desktop": "desktop",
+}
 
 WORKSPACE_PREFIX = (
     HOME
@@ -67,6 +79,7 @@ def scan_session(path):
     git_branch = None
     custom_title = None
     first_prompt = None
+    source = None
 
     try:
         with path.open() as fh:
@@ -82,6 +95,8 @@ def scan_session(path):
                 if not cwd and r.get("cwd"):
                     cwd = r.get("cwd")
                     git_branch = r.get("gitBranch") or git_branch
+                if not source and r.get("entrypoint"):
+                    source = ENTRYPOINT_TO_SOURCE.get(r["entrypoint"], "cli")
                 if t == "user" and not r.get("isMeta") and not first_prompt:
                     txt = extract_message_text(r.get("message", {}))
                     if not is_noise_text(txt):
@@ -103,6 +118,45 @@ def scan_session(path):
         "mtime": stat.st_mtime,
         "size": stat.st_size,
         "path": str(path),
+        "source": source or "cli",  # legacy sessions without an entrypoint field are CLI
+        "is_orphan": False,
+    }
+
+
+def scan_vscode_session(path):
+    # Parses ~/Library/Application Support/Claude/claude-code-sessions/<org>/<workspace>/local_<uuid>.json
+    # into the same shape as scan_session(). These are metadata-only — no transcript —
+    # so first_prompt is always None and Enter on a row of this kind opens a fresh
+    # session in cwd instead of `claude -r`.
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    session_id = data.get("sessionId") or path.stem
+    cwd = data.get("cwd")
+    last = data.get("lastActivityAt") or data.get("createdAt") or 0
+    mtime = last / 1000.0 if last else 0.0  # ms epoch → s
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+
+    # The metadata directory doesn't distinguish vscode-extension from desktop-app
+    # sessions; default to "vscode" since that's the common case for this user.
+    return {
+        "session_id": session_id,
+        "cwd": cwd,
+        "git_branch": None,
+        "custom_title": data.get("title") or None,
+        "first_prompt": None,
+        "mtime": mtime,
+        "size": size,
+        "path": str(path),
+        "source": "vscode",
+        "is_orphan": True,
+        "cli_session_id": data.get("cliSessionId") or "",
     }
 
 
@@ -148,30 +202,65 @@ def absolute_date(mtime):
 def build_index(force_refresh=False):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    jsonl_paths = list(PROJECTS_DIR.glob("*/*.jsonl"))
+    orphan_paths = list(VSCODE_SESSIONS_DIR.glob("*/*/local_*.json"))
+
     if not force_refresh and CACHE_FILE.exists():
         try:
             cache_mtime = CACHE_FILE.stat().st_mtime
             if time.time() - cache_mtime < CACHE_TTL:
-                newest_jsonl = 0.0
-                for p in PROJECTS_DIR.glob("*/*.jsonl"):
+                newest = 0.0
+                for p in jsonl_paths:
                     try:
-                        newest_jsonl = max(newest_jsonl, p.stat().st_mtime)
+                        newest = max(newest, p.stat().st_mtime)
                     except OSError:
                         pass
-                if newest_jsonl < cache_mtime:
-                    return json.loads(CACHE_FILE.read_text())
+                for p in orphan_paths:
+                    try:
+                        newest = max(newest, p.stat().st_mtime)
+                    except OSError:
+                        pass
+                cached = json.loads(CACHE_FILE.read_text())
+                # Cache schema is now {sessions, jsonl_count, orphan_count}.
+                # Old format was a bare list — treat as stale and refresh.
+                if (
+                    isinstance(cached, dict)
+                    and newest < cache_mtime
+                    and cached.get("jsonl_count") == len(jsonl_paths)
+                    and cached.get("orphan_count") == len(orphan_paths)
+                ):
+                    return cached.get("sessions", [])
         except (OSError, json.JSONDecodeError):
             pass
 
     sessions = []
-    for p in PROJECTS_DIR.glob("*/*.jsonl"):
+    jsonl_ids = set()
+    for p in jsonl_paths:
         info = scan_session(p)
         if info:
             info["project"] = project_label(info.get("cwd"))
             sessions.append(info)
+            jsonl_ids.add(info["session_id"])
+
+    # Orphans: a `local_<uuid>.json` whose cliSessionId has no matching JSONL in
+    # PROJECTS_DIR. Those with a matching JSONL are already represented (with
+    # transcript content) by the loop above, so we drop them here.
+    for p in orphan_paths:
+        info = scan_vscode_session(p)
+        if not info:
+            continue
+        cli_id = info.get("cli_session_id")
+        if cli_id and cli_id in jsonl_ids:
+            continue  # JSONL already represents this session — skip the metadata stub
+        info["project"] = project_label(info.get("cwd"))
+        sessions.append(info)
 
     try:
-        CACHE_FILE.write_text(json.dumps(sessions))
+        CACHE_FILE.write_text(json.dumps({
+            "sessions": sessions,
+            "jsonl_count": len(jsonl_paths),
+            "orphan_count": len(orphan_paths),
+        }))
     except OSError:
         pass
     return sessions
@@ -187,12 +276,17 @@ def filter_sessions(sessions, args):
         if not args.include_empty and not args.all:
             # Empty = no real user prompt, even if session was named via `claude -n`.
             # Matches plan definition: session must contain a real user message.
-            if not s.get("first_prompt"):
+            # Orphans never have a first_prompt but carry a metadata title — they're
+            # intentionally surfaced so the user can re-enter the cwd.
+            if not s.get("first_prompt") and not s.get("is_orphan"):
                 continue
         if cutoff and s.get("mtime", 0) < cutoff:
             continue
         if args.project and args.project.lower() not in s.get("project", "").lower():
             continue
+        if getattr(args, "source", "all") not in (None, "all"):
+            if s.get("source") != args.source:
+                continue
         out.append(s)
     return out
 
@@ -235,7 +329,11 @@ def strip_leading_hashtag(s):
 
 
 def format_row(s, label_width=38, max_width=None):
-    label = f"[{s['project']}]"
+    src = s.get("source")
+    if src in ("vscode", "desktop"):
+        label = f"[{s['project']} | {src}]"
+    else:
+        label = f"[{s['project']}]"
     if len(label) > label_width:
         label = label[: label_width - 1] + "]"
     label = label.ljust(label_width)
@@ -559,6 +657,13 @@ def cmd_picker(args):
             print(f"Can't resume {session_id}: no cwd recorded", file=sys.stderr)
             continue
 
+        # Orphans (VS Code/Desktop sessions whose JSONL has aged out) can't be
+        # resumed via `claude -r` — the transcript is gone. Open a fresh session
+        # in the recorded cwd instead, matching projects-view behavior.
+        if match.get("is_orphan"):
+            start_new_session(match["cwd"])
+            continue
+
         resume_session(match["cwd"], session_id)
         continue
 
@@ -604,10 +709,40 @@ def start_new_session(cwd):
     return launch_in_iterm(cwd, shell_cmd, f"cd {cwd} && claude")
 
 
+def cmd_preview_orphan(session_id):
+    # VS Code/Desktop orphan — no transcript on disk. Render metadata only.
+    for p in VSCODE_SESSIONS_DIR.glob(f"*/*/{session_id}.json"):
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        cwd = data.get("cwd") or "(unknown)"
+        title = data.get("title") or "(untitled)"
+        created = data.get("createdAt")
+        last = data.get("lastActivityAt")
+        print(f"Session: {session_id}")
+        print(f"Project: {project_label(data.get('cwd'))}")
+        print(f"cwd:     {cwd}")
+        print(f"Source:  vscode (orphan — transcript aged out)")
+        print(f"Model:   {data.get('model') or '(unknown)'}")
+        if created:
+            print(f"Created: {time.strftime('%Y-%m-%d %H:%M', time.localtime(created / 1000))}")
+        if last:
+            print(f"Last:    {time.strftime('%Y-%m-%d %H:%M', time.localtime(last / 1000))}")
+        print(f"Title:   {strip_leading_hashtag(title)}")
+        print()
+        print("(orphan — no transcript; Enter opens a fresh session in this cwd)")
+        return 0
+    print(f"Orphan {session_id} not found", file=sys.stderr)
+    return 1
+
+
 def cmd_preview(session_id):
     if session_id.startswith("__OVERFLOW_"):
         print("Hint: press Space to expand this group.")
         return 0
+    if session_id.startswith("local_"):
+        return cmd_preview_orphan(session_id)
     for p in PROJECTS_DIR.glob(f"*/{session_id}.jsonl"):
         prompts = []
         last_usage = None
@@ -695,6 +830,7 @@ def cmd_fzf_expand(token, state_path=None):
         per_group = 0
         include_empty = False
         project = None
+        source = "all"
         refresh = False
 
     args = _Args()
@@ -798,12 +934,16 @@ Examples:
   sessions --today                last 24h only (session views)
   sessions --days 30              last 30 days (session views)
   sessions --project my-cfo-hub   filter by project substring (session views)
+  sessions --source vscode        only VS Code-extension sessions (session views)
+  sessions --source cli           only iTerm/Terminal CLI sessions (session views)
   sessions --all                  show everything (no filters, session views)
   sessions --name <uuid> "title"  retroactively name a session
   sessions --resume <uuid>        resume session by UUID from any cwd
 
 In the picker, Ctrl-T cycles through projects → time → project views.
 Enter on a project row opens a fresh Claude Code session in that cwd.
+Enter on an orphan VS Code/Desktop row (no transcript left) opens a fresh
+session in its recorded cwd.
 """,
     )
     parser.add_argument("--list", action="store_true", help="Plain output (no fzf).")
@@ -820,6 +960,10 @@ Enter on a project row opens a fresh Claude Code session in that cwd.
     parser.add_argument("--include-empty", action="store_true",
                         help="Include aborted/empty sessions.")
     parser.add_argument("--project", type=str, help="Filter by project substring.")
+    parser.add_argument("--source", choices=["cli", "vscode", "desktop", "all"],
+                        default="all",
+                        help="Filter by originating environment (session views only; "
+                             "projects view is unfiltered, same as --days).")
     parser.add_argument("--refresh", action="store_true",
                         help="Ignore cache, rescan all JSONLs.")
     parser.add_argument("--name", nargs=2, metavar=("UUID", "TITLE"),

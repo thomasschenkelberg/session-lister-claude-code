@@ -21,13 +21,18 @@ GitHub: https://github.com/tschenkster/session-lister-claude-code (MIT)
 
 ## Testing
 
-No formal test suite. Smoke checks on a machine with a populated `~/.claude/projects/`:
+No formal test suite. Smoke checks on a machine with a populated `~/.claude/projects/` and `~/Library/Application Support/Claude/claude-code-sessions/`:
 
-- `sessions --list` → default-filtered output (non-empty, 14-day, per-group cap 10, global 60).
-- `sessions --all --list | wc -l` should match `find ~/.claude/projects -maxdepth 2 -name '*.jsonl' | wc -l`.
+- `sessions --list` → default-filtered output (non-empty + orphan rows, 56-day, per-group cap 10, global 300).
+- `sessions --all --list | wc -l` ≈ JSONL count + orphan count: `find ~/.claude/projects -maxdepth 2 -name '*.jsonl' | wc -l` plus orphan `local_*.json` files whose `cliSessionId` has no matching JSONL.
+- `sessions --source cli --list` and `sessions --source vscode --list` are **disjoint**; `--source all` ≈ union.
+- `sessions --source vscode --list | grep -c ' | vscode'` is non-zero on a machine that's used the VS Code extension.
+- `sessions --source desktop --list` exercises the desktop path (may be small or empty depending on Desktop usage).
 - `sessions --project <slug>` bypasses the per-group cap.
+- Orphan smoke: pick a `local_*.json` whose `cliSessionId` is NOT in `~/.claude/projects/`, verify it appears in `sessions --source vscode --list`, that `sessions --preview local_<uuid>` renders metadata only without crash, and that picker Enter on that row routes to `start_new_session` (opens fresh in cwd, no `claude -r`).
+- Cache invalidation: delete a JSONL whose `cliSessionId` matches an orphan metadata file → next `sessions --list` shows the freshly-promoted orphan even when no file is newer than the cache (count-aware check fires).
 - `sessions --name <uuid> "<title>"` is readable back via `sessions --list --project <slug>`.
-- Cache: cold run ~0.4s, warm run ~0.04s.
+- Cache: cold run ~0.5s, warm run ~0.05s (slight rise from scanning ~74 extra small JSON metadata files).
 
 
 ## Claude Memory Sync
