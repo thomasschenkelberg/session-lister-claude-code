@@ -2,7 +2,7 @@
 
 Public utility for browsing and resuming Claude Code sessions across all project folders. Solves the cwd-scoping limitation of the built-in `claude -r` picker.
 
-GitHub: https://github.com/tschenkster/session-lister-claude-code (MIT)
+GitHub: https://github.com/thomasschenkelberg/session-lister-claude-code (MIT)
 
 ## Structure
 
