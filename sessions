@@ -39,7 +39,7 @@ ENTRYPOINT_TO_SOURCE = {
 
 WORKSPACE_PREFIX = (
     HOME
-    / "Library/CloudStorage/GoogleDrive-thomas@cfo-team.de/My Drive/Claude Workspace "
+    / "Library/CloudStorage/GoogleDrive-thomas@cfo-team.de/My Drive/agent-business-storage-root"
 )
 
 COMMAND_PREFIXES = ("<command-name>", "<local-command-stdout>", "<local-command-stderr>")
