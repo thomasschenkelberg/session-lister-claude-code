@@ -145,6 +145,16 @@ For a small personal utility that walks files and shells out to `fzf` and `claud
 
 The only external runtime requirement is `fzf`, which does the heavy lifting of the picker UI better than anything you'd write yourself.
 
+## Repo layout
+
+| Path | Role |
+|---|---|
+| `sessions` | The entire program - one Python 3 file, stdlib only |
+| `commands/sessions.md` | The `/sessions` slash command, copied to `~/.claude/commands/` |
+| `install.sh` | Idempotent installer (symlink + slash-command copy) |
+| `AGENTS.md` | Instructions for coding agents working on this repo |
+| `LICENSE` | MIT |
+
 ## Configuration
 
 No config file. Everything is flags. A few things you might want to tweak in the script:
