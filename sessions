@@ -184,7 +184,12 @@ def project_label(cwd):
         parts = [p for p in rest.split("/") if p]
         if not parts:
             return "workspace-root"
-        return "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
+        # 20-consulting-work splits into client-materials/ and
+        # shared-materials/ before the area level, so it needs a third
+        # segment to keep "20-consulting-work/client-materials/active-clients"
+        # apart from "20-consulting-work/shared-materials/slide-library".
+        depth = 3 if parts[0] == "20-consulting-work" else 2
+        return "/".join(parts[:depth])
     # outside workspace
     return f"external/{Path(cwd).name}"
 
