@@ -21,7 +21,7 @@ GitHub: https://github.com/thomasschenkelberg/session-lister-claude-code (MIT)
 
 ## Testing
 
-No formal test suite. Smoke checks on a machine with a populated `~/.claude/projects/` and `~/Library/Application Support/Claude/claude-code-sessions/`:
+`python3 tests.py` runs the stdlib unittest regression tests (issue-driven: one test per bug that broke). Beyond that, smoke checks on a machine with a populated `~/.claude/projects/` and `~/Library/Application Support/Claude/claude-code-sessions/`:
 
 - `sessions --list` → default-filtered output (non-empty + orphan rows, 56-day, per-group cap 10, global 300).
 - `sessions --all --list | wc -l` ≈ JSONL count + orphan count: `find ~/.claude/projects -maxdepth 2 -name '*.jsonl' | wc -l` plus orphan `local_*.json` files whose `cliSessionId` has no matching JSONL.
